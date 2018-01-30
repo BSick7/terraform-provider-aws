@@ -32,6 +32,10 @@ func resourceAwsDynamoDbTable() *schema.Resource {
 		SchemaVersion: 1,
 		MigrateState:  resourceAwsDynamoDbTableMigrateState,
 
+		CustomizeDiff: func(diff *schema.ResourceDiff, v interface{}) error {
+			return validateDynamoDbTableAttributes(diff)
+		},
+
 		Schema: map[string]*schema.Schema{
 			"arn": {
 				Type:     schema.TypeString,
@@ -317,11 +321,10 @@ func resourceAwsDynamoDbTableUpdate(d *schema.ResourceData, meta interface{}) er
 		}
 	}
 
-	if d.HasChange("global_secondary_index") && !d.IsNewResource() {
-		var attributes []*dynamodb.AttributeDefinition
-		if v, ok := d.GetOk("attribute"); ok {
-			attributes = expandDynamoDbAttributes(v.(*schema.Set).List())
-		}
+	// Indexes and attributes are tightly coupled (DynamoDB disallows unindexed attributes)
+	// so it's necessary to update these together.
+	if (d.HasChange("global_secondary_index") || d.HasChange("attribute")) && !d.IsNewResource() {
+		attributes := d.Get("attribute").(*schema.Set).List()
 
 		o, n := d.GetChange("global_secondary_index")
 		ops, err := diffDynamoDbGSI(o.(*schema.Set).List(), n.(*schema.Set).List())
@@ -332,12 +335,13 @@ func resourceAwsDynamoDbTableUpdate(d *schema.ResourceData, meta interface{}) er
 
 		input := &dynamodb.UpdateTableInput{
 			TableName:            aws.String(d.Id()),
-			AttributeDefinitions: attributes,
+			AttributeDefinitions: expandDynamoDbAttributes(attributes),
 		}
 
 		// Only 1 online index can be created or deleted simultaneously per table
 		for _, op := range ops {
 			input.GlobalSecondaryIndexUpdates = []*dynamodb.GlobalSecondaryIndexUpdate{op}
+			log.Printf("[DEBUG] Updating DynamoDB Table: %s", input)
 			_, err := conn.UpdateTable(input)
 			if err != nil {
 				return err
@@ -359,6 +363,14 @@ func resourceAwsDynamoDbTableUpdate(d *schema.ResourceData, meta interface{}) er
 				if err := waitForDynamoDbGSIToBeDeleted(d.Id(), idxName, conn); err != nil {
 					return fmt.Errorf("Error waiting for DynamoDB GSI %q to be deleted: %s", idxName, err)
 				}
+			}
+		}
+
+		// We may only be changing the attribute type
+		if len(ops) == 0 {
+			_, err := conn.UpdateTable(input)
+			if err != nil {
+				return err
 			}
 		}
 
